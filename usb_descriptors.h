@@ -25,6 +25,9 @@
 #ifndef USB_DESCRIPTORS_H_
 #define USB_DESCRIPTORS_H_
 
+#include <stdint.h>
+#include <stdbool.h>
+
 enum
 {
   VENDOR_REQUEST_WEBUSB = 1,
@@ -32,5 +35,10 @@ enum
 };
 
 extern uint8_t const desc_ms_os_20[];
+
+// WebUSB landing-page advertising, persisted in flash (default = enabled).
+// Defined in main.c; the BOS descriptor callback reads it at enumeration.
+bool landing_page_enabled(void);
+void set_landing_page_enabled(bool enabled);
 
 #endif /* USB_DESCRIPTORS_H_ */

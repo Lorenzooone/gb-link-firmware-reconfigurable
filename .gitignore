@@ -15,3 +15,4 @@ CMakeCache.txt
 pico-sdk
 spi.pio.h
 cmake_install.cmake
+/build

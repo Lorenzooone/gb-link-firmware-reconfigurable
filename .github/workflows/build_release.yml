@@ -1,0 +1,41 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers when you push a tag like v1.0, v0.9, etc.
+
+permissions:
+  contents: write # Required to allow the Action to create a Release
+
+jobs:
+  build_and_release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Install Arm Toolchain & CMake
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential cmake
+
+    - name: Configure CMake
+      # We pass -DPICO_SDK_FETCH_FROM_GIT=ON so the build system downloads the SDK automatically
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DPICO_SDK_FETCH_FROM_GIT=ON
+
+    - name: Compile Firmware
+      run: |
+        cd build
+        make
+
+    - name: Create Release & Upload UF2
+      uses: softprops/action-gh-release@v2
+      with:
+        files: build/gbusb.uf2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

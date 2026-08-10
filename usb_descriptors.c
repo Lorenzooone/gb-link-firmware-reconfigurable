@@ -54,7 +54,7 @@ tusb_desc_device_t const desc_device =
 
     .idVendor           = 0xCafe,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = 0x0107,
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -136,8 +136,9 @@ https://developers.google.com/web/fundamentals/native-hardware/build-for-webusb/
 
 #define MS_OS_20_DESC_LEN  0xB2
 
-// BOS Descriptor is required for webUSB
-uint8_t const desc_bos[] =
+// BOS Descriptor is required for webUSB. Not const: iLandingPage is patched at
+// enumeration to reflect the persisted toggle (see tud_descriptor_bos_cb).
+uint8_t desc_bos[] =
 {
   // total length, number of device caps
   TUD_BOS_DESCRIPTOR(BOS_TOTAL_LEN, 2),
@@ -149,8 +150,15 @@ uint8_t const desc_bos[] =
   TUD_BOS_MS_OS_20_DESCRIPTOR(MS_OS_20_DESC_LEN, VENDOR_REQUEST_MICROSOFT)
 };
 
+// iLandingPage is the last byte of the WebUSB platform capability descriptor,
+// which follows the BOS header.
+#define WEBUSB_LANDING_PAGE_OFFSET (TUD_BOS_DESC_LEN + TUD_BOS_WEBUSB_DESC_LEN - 1)
+
 uint8_t const * tud_descriptor_bos_cb(void)
 {
+  // 1 = advertise the landing page (Chrome shows the "open launcher" prompt),
+  // 0 = no landing page. Persisted via the WebUSB "LAND" command.
+  desc_bos[WEBUSB_LANDING_PAGE_OFFSET] = landing_page_enabled() ? 1 : 0;
   return desc_bos;
 }
 
@@ -239,3 +247,4 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 
   return _desc_str;
 }
+
