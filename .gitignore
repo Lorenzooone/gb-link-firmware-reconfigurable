@@ -11,6 +11,7 @@ Makefile
 *.dis
 *.bin
 *.map
+*.pio.h
 CMakeCache.txt
 pico-sdk
 spi.pio.h

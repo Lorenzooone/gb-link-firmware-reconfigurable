@@ -35,6 +35,8 @@
 #include "hardware/pio.h"
 #include "pio/pio_spi.h"
 #include "pico/time.h"
+#include "pio/linkcable_passive.h"
+#include "pio/useful_qualifiers.h"
 
 #define NUM_CMP_BYTES 0x20
 #define NUM_CMP_BYTES_RECV (NUM_CMP_BYTES+4)
@@ -106,17 +108,33 @@ void data_transfer_task(void);
 void led_blinking_task(void);
 void cdc_task(void);
 void webserial_task(void);
+void TIME_SENSITIVE(link_cable_passive_handler)(void);
 
 /*------------- MAIN -------------*/
 
   pio_spi_inst_t spi = {
           .pio = pio1,
-          .sm = 0
+          .sm = 0,
+          .cpol = 1,
   };
 
+void pio_spi_active_enable() {
+	pio_spi_active_activate(spi.pio, spi.sm, spi.program_offset, spi.cpol, PIN_SCK, PIN_SIN, PIN_SOUT);
+}
+
+void pio_spi_active_disable() {
+	pio_sm_set_enabled(spi.pio, spi.sm, false);
+    pio_sm_clear_fifos(spi.pio, spi.sm);
+    pio_sm_restart(spi.pio, spi.sm);
+    pio_sm_clkdiv_restart(spi.pio, spi.sm);
+    pio_sm_exec(spi.pio, spi.sm, pio_encode_jmp(spi.program_offset));
+}
 
 int main(void)
 {
+/*
+  // Fails on Stacksmashing board...
+  // Code for clones...
   // Check the state of TEST_PIN
   if (is_test_pin_grounded()) {
     // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SI_PIN
@@ -128,11 +146,17 @@ int main(void)
     PIN_SOUT = 2;
     SI_PIN = 3;
   }
-
+*/
   //board_init();
   buf_count = 0;
-  uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
-  pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
+  uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_active_program);
+  spi.program_offset = cpha1_prog_offs;
+  pio_spi_active_init_partial(spi.pio, spi.sm, spi.program_offset, 8, 4058.838/128, PIN_SCK, PIN_SIN, PIN_SOUT);
+
+  linkcable_passive_init(link_cable_passive_handler, 1, 1, 8, PIN_SCK, PIN_SIN, PIN_SOUT);
+
+  pio_spi_active_enable();
+  //linkcable_passive_enable();
 
   tusb_init();
 
@@ -163,6 +187,12 @@ int oldmain(void)
   }
 
   return 0;
+}
+
+void TIME_SENSITIVE(link_cable_passive_handler)(void) {
+    uint32_t data = linkcable_passive_receive();
+    linkcable_passive_flush();
+    linkcable_passive_send(data);
 }
 
 // send characters to both CDC and WebUSB

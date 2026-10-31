@@ -1,0 +1,88 @@
+; Copyright (c) 2026 Lorenzooone
+
+; SIO Passive
+.program linkcable_sm_passive
+
+.define public CLOCK_DIV 3
+
+.define public WAIT_FIRST (12/CLOCK_DIV)
+.define public WAIT_MIDDLE (12/CLOCK_DIV)
+.define public WAIT_LAST (12/CLOCK_DIV)
+
+.wrap_target
+    wait 0 gpio 0 [WAIT_FIRST]            ; wait for falling edge
+    ;irq 1                                 ; comment out if no DEBUG_TIMEFRAMES
+    pull noblock                          ; pull value for transmission from pico
+    mov x, y
+    out pins, 1                           ; out the MSB bit
+    wait 1 gpio 0 [WAIT_MIDDLE]           ; wait for rising edge
+bitloop:
+        in pins, 1                        ; input bit
+        wait 0 gpio 0 [WAIT_MIDDLE]       ; wait for falling edge
+        out pins, 1                       ; output rest of the bits one by one
+        wait 1 gpio 0 [WAIT_LAST]         ; wait for rising edge
+    jmp x-- bitloop                       ; loop through the rest of the bits
+    in pins, 1                            ; input rest of the bits one by one
+    push noblock                          ; push the received value to pico
+    irq 0
+.wrap
+
+% c-sdk {
+
+static pio_sm_config pio_config_linkcable_passive;
+
+static inline void linkcable_sm_passive_select_mode(PIO pio, uint sm, uint num_bits) {
+    pio_sm_exec(pio, sm, pio_encode_set(pio_y, num_bits - 2));
+}
+
+static inline struct pio_program linkcable_sm_passive_patch_gpio_sck_and_load(uint pin_sck, uint16_t* patched_instructions) {    
+    for (int i = 0; i < linkcable_sm_passive_program.length; i++) {
+        patched_instructions[i] = linkcable_sm_passive_program.instructions[i];
+    }
+
+    uint pio_wait_indexes[] = {0, 4, 6, 8};
+    //uint pio_wait_indexes[] = {0, 5, 7, 9}; // If IRQ 1 is enabled
+
+    patched_instructions[pio_wait_indexes[0]] = pio_encode_wait_gpio(false, pin_sck) | (linkcable_sm_passive_WAIT_FIRST << 8);
+    patched_instructions[pio_wait_indexes[1]] = pio_encode_wait_gpio(true,  pin_sck) | (linkcable_sm_passive_WAIT_MIDDLE << 8);
+    patched_instructions[pio_wait_indexes[2]] = pio_encode_wait_gpio(false, pin_sck) | (linkcable_sm_passive_WAIT_MIDDLE << 8);
+    patched_instructions[pio_wait_indexes[3]] = pio_encode_wait_gpio(true,  pin_sck) | (linkcable_sm_passive_WAIT_LAST << 8);
+
+    struct pio_program patched_program = {
+        .instructions = patched_instructions,
+        .length = linkcable_sm_passive_program.length,
+        .origin = linkcable_sm_passive_program.origin
+    };
+    return patched_program;
+}
+
+static inline void linkcable_sm_passive_program_init_partial(PIO pio, uint sm, uint offset, uint max_bits, uint pin_sck, uint pin_sin, uint pin_sout) {
+    pio_sm_config c = linkcable_sm_passive_program_get_default_config(offset);
+
+
+    sm_config_set_in_pins(&c, pin_sin);
+    sm_config_set_in_shift(&c, false, false, max_bits);
+
+    sm_config_set_out_pins(&c, pin_sout, 1);
+    sm_config_set_out_shift(&c, false, false, max_bits);
+
+    sm_config_set_clkdiv(&c, linkcable_sm_passive_CLOCK_DIV); // Set clock division
+
+    pio_config_linkcable_passive = c;
+    pio_sm_set_enabled(pio, sm, false);
+}
+
+static inline void linkcable_sm_passive_activate(PIO pio, uint sm, uint offset, uint num_bits, uint pin_sck, uint pin_sin, uint pin_sout) {
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_sck, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_sin, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_sout, 1, true);
+
+    pio_gpio_init(pio, pin_sck);
+    pio_gpio_init(pio, pin_sin);
+    pio_gpio_init(pio, pin_sout);
+
+    pio_sm_init(pio, sm, offset, &pio_config_linkcable_passive);
+    linkcable_sm_passive_select_mode(pio, sm, num_bits);
+    pio_sm_set_enabled(pio, sm, true); // Set the state machine running
+}
+%}

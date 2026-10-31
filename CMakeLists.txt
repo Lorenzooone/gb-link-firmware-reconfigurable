@@ -9,6 +9,7 @@ pico_sdk_init()
 add_executable(gbusb)
 
 pico_generate_pio_header(gbusb ${CMAKE_CURRENT_LIST_DIR}/pio/spi.pio)
+pico_generate_pio_header(gbusb ${CMAKE_CURRENT_LIST_DIR}/pio/linkcable_passive.pio)
 
 target_include_directories(gbusb PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
@@ -19,6 +20,8 @@ target_sources(gbusb PRIVATE
 
         # PIO components
         pio/pio_spi.c
+        pio/linkcable_passive.c
+        pio/sync.c
         )
         
 target_link_libraries(gbusb PRIVATE pico_stdlib hardware_pio tinyusb_device tinyusb_board)
