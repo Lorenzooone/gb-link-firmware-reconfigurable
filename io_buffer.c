@@ -92,9 +92,9 @@ uint32_t _get_data_checksum(struct io_buffer* b, size_t start, size_t end) {
     size_t curr_elem_in_checksum = 0;
     size_t curr_pos = start;
     while(curr_pos != end) {
-      checksum += (b->p[curr_pos++]) << (8 * curr_elem_in_checksum);
-      curr_pos %= b->size;
-      curr_elem_in_checksum = (curr_elem_in_checksum + 1) % sizeof(checksum);
+        checksum += (b->p[curr_pos++]) << (8 * curr_elem_in_checksum);
+        curr_pos %= b->size;
+        curr_elem_in_checksum = (curr_elem_in_checksum + 1) % sizeof(checksum);
     }
     return checksum;
 }
