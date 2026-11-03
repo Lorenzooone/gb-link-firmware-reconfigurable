@@ -37,9 +37,24 @@
 #include "pico/time.h"
 #include "pio/linkcable_passive.h"
 #include "pio/useful_qualifiers.h"
+#include "utils.h"
 
 #define NUM_CMP_BYTES 0x20
 #define NUM_CMP_BYTES_RECV (NUM_CMP_BYTES+4)
+#define PROTOCOL_VERSION_NUMBER 2
+
+// USB Opcodes
+#define OPCODE_USB_SET_ACTIVE_MODE 1 // Switch to active mode
+#define OPCODE_USB_SET_PASSIVE_MODE 2 // Switch to passive mode
+#define OPCODE_USB_RESET_PASSIVE_MODE_BUFFERS 3 // Reset passive mode buffers if an error happens
+#define OPCODE_USB_SET_PASSIVE_MODE_DEFAULT 4 // Sets the bytes to send to the host if nothing is enqueued
+#define OPCODE_USB_SET_PASSIVE_MODE_SECTION_PREAMBLE_WAITING 5 // Section Preamble mode: prepare preamble_data_to_find, data_waiting_for_preamble
+#define OPCODE_USB_PASSIVE_MODE_SECTION_GET_CHECKSUM_AND_LEN 6 // Get length of the data loaded in and checksum, to ensure the transfer went well
+#define OPCODE_USB_PASSIVE_MODE_SECTION_START 7 // Start section preamble mode officially
+#define OPCODE_USB_PASSIVE_MODE_SECTION_GET_IS_DONE_AND_LEN 8 // Get if the section preamble mode is done, as well as the current length
+#define OPCODE_USB_RETURN_TO_REGULAR_PASSIVE_MODE 9 // Return to the regular passive mode from the section preamble mode
+#define OPCODE_USB_RESET_PASSIVE_MODE 10 // Reset passive mode entirely in case of an error in bits trasmitted
+#define OPCODE_USB_PASSIVE_MODE_GET_SECTION_DATA 11 // Request for some section data
 
 #define NUM_DEFAULT_BYTES_PER_TRANSFER 1
 #define US_DEFAULT_PER_TRANSFER 1000
@@ -90,6 +105,21 @@ static uint8_t num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
 static uint32_t us_between_transfer = US_DEFAULT_PER_TRANSFER;
 static uint32_t total_transferred = 0;
 
+// Determine which of the two modes to use...
+static bool is_mode_active = true;
+
+// Data for Passive mode
+# include "io_buffer.h" // Buffers which will keep the data to send/receive.
+static uint32_t passive_no_data_default = 0; // Used when there is no data to send...
+static bool passive_is_scheduled_real_data = false; // Used to distinguish when data should be saved.
+
+static uint32_t preamble_data_to_find = 0; // Used for preamble-section mode...
+static uint32_t data_waiting_for_preamble = 0; // Data sent while waiting for the preamble.
+static bool is_preamble_mode_being_setup = false;
+static bool is_preamble_mode_requested = false;
+static bool has_preamble_started = false;
+static bool is_past_preamble = false;
+
 #define URL  "tetris.gblink.io"
 
 const tusb_desc_webusb_url_t desc_url =
@@ -104,7 +134,7 @@ static bool web_serial_connected = false;
 
 //------------- prototypes -------------//
 void handle_input_data(uint8_t* buf_in, uint32_t count);
-void data_transfer_task(void);
+void handle_output_data(void);
 void led_blinking_task(void);
 void cdc_task(void);
 void webserial_task(void);
@@ -157,15 +187,16 @@ int main(void)
 
   pio_spi_active_enable();
   //linkcable_passive_enable();
+  //is_mode_active = false;
 
   tusb_init();
 
   while (1)
   {
     tud_task(); // tinyusb device task
-    data_transfer_task();
     cdc_task();
     webserial_task();
+    handle_output_data();
     led_blinking_task();
   }
 
@@ -183,6 +214,7 @@ int oldmain(void)
     tud_task(); // tinyusb device task
     cdc_task();
     webserial_task();
+    handle_output_data();
     led_blinking_task();
   }
 
@@ -190,7 +222,43 @@ int oldmain(void)
 }
 
 void TIME_SENSITIVE(link_cable_passive_handler)(void) {
-    uint32_t data = linkcable_passive_receive();
+    uint32_t recieved_data = linkcable_passive_receive();
+
+    if(passive_is_scheduled_real_data) {
+      set_data_out((uint8_t*)&recieved_data, num_bytes_per_transfer, 0);
+    }
+
+    passive_is_scheduled_real_data = false;
+    uint32_t data = passive_no_data_default;
+
+    if(is_preamble_mode_being_setup) {
+      // Do nothing, as the default behaviour is fine
+    }
+    else if(is_preamble_mode_requested) {
+      if((!has_preamble_started) && (recieved_data == preamble_data_to_find))
+        has_preamble_started = true;
+      if((!is_past_preamble) && has_preamble_started && (recieved_data != preamble_data_to_find)) {
+        is_past_preamble = true;
+        // Insert the first byte
+        set_data_out((uint8_t*)&recieved_data, num_bytes_per_transfer, 0);
+      }
+
+      if(!has_preamble_started)
+        data = data_waiting_for_preamble;
+      else if(!is_past_preamble)
+        data = preamble_data_to_find;
+      else if(available_data_in() > 0) {
+        data = get_data_in();
+        // The last byte won't be part of the section - Do not add it
+        if(available_data_in() > 0)
+            passive_is_scheduled_real_data = true;
+      }
+    }
+    else if(available_data_in() > 0) {
+      data = get_data_in();
+      passive_is_scheduled_real_data = true;
+    }
+
     linkcable_passive_flush();
     linkcable_passive_send(data);
 }
@@ -319,65 +387,286 @@ bool tud_vendor_control_complete_cb(uint8_t rhport, tusb_control_request_t const
   return true;
 }
 
-void data_transfer_task(void) {
-    //if(buf_count) {
-        //uint8_t buf_out[MAX_TRANSFER_BYTES];
-    //    for(int i = 0; i < (buf_count+3) >> 2; i++) {
-    //        pio_spi_write8_blocking(&spi, data_buf+(4*i), 4);
-    //        busy_wait_us(36);
-    //    }
-        //pio_spi_write8_read8_blocking(&spi, data_buf, buf_out, buf_count);
-        //echo_all(buf_out, buf_count);
-    //    buf_count = 0;
-    //}
+static void process_base_config_packet(uint8_t* buf_in) {
+  bool has_found_non_ff = false;
+  uint8_t processed = 0;
+
+  for(int i = NUM_CMP_BYTES; i < NUM_CMP_BYTES_RECV; i++)
+    if(buf_in[i] != 0xFF) {
+      has_found_non_ff = true;
+      break;
+    }
+
+  if(!has_found_non_ff) {
+    // Make this a version return
+    processed = PROTOCOL_VERSION_NUMBER;
+    echo_all(&processed, 1);
+    return;
+  }
+
+  us_between_transfer = (buf_in[NUM_CMP_BYTES]<<0) + (buf_in[NUM_CMP_BYTES+1]<<8) + (buf_in[NUM_CMP_BYTES+2]<<16);
+  num_bytes_per_transfer = buf_in[NUM_CMP_BYTES+3];
+  if(num_bytes_per_transfer > MAX_TRANSFER_BYTES)
+    num_bytes_per_transfer = MAX_TRANSFER_BYTES;
+  processed = 1;
+  echo_all(&processed, 1);
+}
+
+static void reset_preamble_section_data() {
+  is_preamble_mode_being_setup = false;
+  is_preamble_mode_requested = false;
+  has_preamble_started = false;
+  is_past_preamble = false;
+}
+
+static bool process_special_packets(uint8_t* buf_in, uint32_t count) {
+  // Is this a special packet?
+  // Check if it is. If this returns true, handle it.
+  uint8_t processed = 0;
+  if(count >= (NUM_CMP_BYTES + 1)) {
+    processed = 1;
+    for(int i = 0; i < NUM_CMP_BYTES; i++)
+      if(buf_in[i] != compare_bytes[i]) {
+        processed = 0;
+        break;
+      }
+  }
+
+  if(!processed)
+    return false;
+
+  // Base message for active reconfiguration.
+  if(count == NUM_CMP_BYTES_RECV) {
+      process_base_config_packet(buf_in);
+      return true;
+  }
+
+  size_t start_data_post_opcode = NUM_CMP_BYTES + 1;
+  size_t size_post_opcode = count - start_data_post_opcode;
+  uint8_t buffer_out[MAX_TRANSFER_BYTES];
+  size_t length_field = 0;
+  processed = PROTOCOL_VERSION_NUMBER;
+
+  switch(buf_in[NUM_CMP_BYTES]) {
+    // Switch to active mode
+    case OPCODE_USB_SET_ACTIVE_MODE:
+      if(size_post_opcode == 0) {
+        if(!is_mode_active) {
+          is_mode_active = true;
+          linkcable_passive_disable();
+          pio_spi_active_enable();
+        }
+        echo_all(&processed, 1);
+        return true;
+      }
+      break;
+    // Switch to passive mode
+    case OPCODE_USB_SET_PASSIVE_MODE:
+      if(size_post_opcode == 0) {
+        if(is_mode_active) {
+          reset_preamble_section_data();
+          passive_is_scheduled_real_data = false;
+          reset_data_out();
+          reset_data_in();
+          is_mode_active = false;
+          pio_spi_active_disable();
+          linkcable_passive_enable();
+        }
+        echo_all(&processed, 1);
+        return true;
+      }
+    // Reset passive mode buffers if an error happens
+    case OPCODE_USB_RESET_PASSIVE_MODE_BUFFERS:
+      if(size_post_opcode == 0) {
+        reset_data_out();
+        reset_data_in();
+        echo_all(&processed, 1);
+        return true;
+      }
+      break;
+    // Sets the bytes to send to the host if nothing is enqueued
+    case OPCODE_USB_SET_PASSIVE_MODE_DEFAULT:
+      if(size_post_opcode == sizeof(uint32_t)) {
+        passive_no_data_default = read_u32_le(buf_in, start_data_post_opcode);
+        write_u32_le(buffer_out, 0, passive_no_data_default);
+        echo_all(buffer_out, sizeof(uint32_t));
+        return true;
+      }
+      break;
+    // Section Preamble mode: prepare preamble_data_to_find, data_waiting_for_preamble
+    //https://github.com/pret/pokecrystal/blob/619f3703486b3b40f69d31b1911b58aa0a721a6e/home/serial.asm#L91
+    case OPCODE_USB_SET_PASSIVE_MODE_SECTION_PREAMBLE_WAITING:
+      if(size_post_opcode == (sizeof(uint32_t) + sizeof(uint32_t))) {
+        passive_is_scheduled_real_data = false;
+        reset_data_out();
+        reset_data_in();
+        reset_preamble_section_data();
+        is_preamble_mode_being_setup = true;
+        is_preamble_mode_requested = true;
+        preamble_data_to_find = read_u32_le(buf_in, start_data_post_opcode);
+        data_waiting_for_preamble = read_u32_le(buf_in, start_data_post_opcode + sizeof(uint32_t));
+        write_u32_le(buffer_out, 0, preamble_data_to_find);
+        write_u32_le(buffer_out, sizeof(uint32_t), data_waiting_for_preamble);
+        echo_all(buffer_out, sizeof(uint32_t) + sizeof(uint32_t));
+        return true;
+      }
+      break;
+    // Get length of the data loaded in and checksum, to ensure the transfer went well
+    case OPCODE_USB_PASSIVE_MODE_SECTION_GET_CHECKSUM_AND_LEN:
+      if(size_post_opcode == 0) {
+        write_u32_le(buffer_out, 0, get_data_in_checksum());
+        write_u32_le(buffer_out, sizeof(uint32_t), available_data_in());
+        echo_all(buffer_out, sizeof(uint32_t) + sizeof(uint32_t));
+        return true;
+      }
+      break;
+    // Start section preamble mode officially
+    case OPCODE_USB_PASSIVE_MODE_SECTION_START:
+      if(size_post_opcode == 0) {
+        is_preamble_mode_being_setup = false;
+        echo_all(&processed, 1);
+        return true;
+      }
+      break;
+    // Get if the section preamble mode is done, as well as the current length
+    case OPCODE_USB_PASSIVE_MODE_SECTION_GET_IS_DONE_AND_LEN:
+      if(size_post_opcode == 0) {
+        buffer_out[0] = 0;
+        size_t curr_to_transfer = available_data_in();
+        if((curr_to_transfer == 0) && (!passive_is_scheduled_real_data))
+          buffer_out[0] = 1;
+        write_u32_le(buffer_out, 1, available_data_out());
+        write_u32_le(buffer_out, 1 + sizeof(uint32_t), curr_to_transfer);
+        echo_all(buffer_out, 1 + sizeof(uint32_t) + sizeof(uint32_t));
+        return true;
+      }
+      break;
+    // Return to the regular passive mode from the section preamble mode
+    case OPCODE_USB_RETURN_TO_REGULAR_PASSIVE_MODE:
+      if(size_post_opcode == 0) {
+        passive_is_scheduled_real_data = false;
+        reset_data_out();
+        reset_data_in();
+        reset_preamble_section_data();
+        echo_all(&processed, 1);
+        return true;
+      }
+      break;
+    // Reset passive mode entirely in case of an error in bits trasmitted
+    case OPCODE_USB_RESET_PASSIVE_MODE:
+      if(size_post_opcode == 0) {
+        if(!is_mode_active) {
+          linkcable_passive_disable();
+          passive_is_scheduled_real_data = false;
+          reset_data_out();
+          reset_data_in();
+          reset_preamble_section_data();
+          linkcable_passive_enable();
+        }
+        echo_all(&processed, 1);
+        return true;
+      }
+      break;
+    // Host request for some section data
+    case OPCODE_USB_PASSIVE_MODE_GET_SECTION_DATA:
+      if(size_post_opcode == sizeof(uint32_t)) {
+        if(is_preamble_mode_requested) {
+          // Validate length request and insert it in data returned...
+          length_field = read_u32_le(buf_in, start_data_post_opcode);
+          if(length_field > available_data_out())
+            length_field = available_data_out();
+          if(length_field > (MAX_TRANSFER_BYTES - sizeof(uint32_t)))
+            length_field = MAX_TRANSFER_BYTES - sizeof(uint32_t);
+
+          // Extract the data from the buffer and put it in...
+          bool success = false;
+          uint8_t total_processed = 0;
+          for(size_t i = 0; i < length_field; i++) {
+            uint8_t data = get_data_out(&success);
+            if(success)
+              buffer_out[(total_processed++) + sizeof(uint32_t)] = data;
+          }
+          length_field = total_processed;
+        }
+
+        write_u32_le(buffer_out, 0, length_field);
+        echo_all(buffer_out, length_field + sizeof(uint32_t));
+        return true;
+      }
+      break;
+    default:
+      break;
+  }
+
+  return false;
 }
 
 void handle_input_data(uint8_t* buf_in, uint32_t count) {
   for(int i = count; i < (MAX_TRANSFER_BYTES*2); i++)
     buf_in[i] = 0;
-  uint8_t processed = 0;
-  if(count == NUM_CMP_BYTES_RECV) {
-    uint8_t failed = 0;
-    for(int i = 0; i < NUM_CMP_BYTES; i++)
-      if(buf_in[i] != compare_bytes[i]) {
-        failed = 1;
-        break;
+
+  bool has_been_processed = process_special_packets(buf_in, count);
+
+  if(!has_been_processed) {
+    if(is_mode_active) {
+      // pprintf("Sending: %02x", buf[0]);
+      uint8_t total_processed = 0;
+      uint8_t buf_out[MAX_TRANSFER_BYTES*2];
+      while(total_processed < count) {
+        uint8_t transferable = num_bytes_per_transfer;
+        //if(count-total_processed < transferable)
+          //transferable = count-total_processed;
+        pio_spi_write8_read8_blocking(&spi, buf_in + total_processed, buf_out + total_processed, transferable);
+        total_transferred += transferable;
+        total_processed += transferable;
+        busy_wait_us(us_between_transfer);
       }
-    if(!failed) {
-      us_between_transfer = (buf_in[NUM_CMP_BYTES]<<0) + (buf_in[NUM_CMP_BYTES+1]<<8) + (buf_in[NUM_CMP_BYTES+2]<<16);
-      num_bytes_per_transfer = buf_in[NUM_CMP_BYTES+3];
-      if(num_bytes_per_transfer > MAX_TRANSFER_BYTES)
-        num_bytes_per_transfer = MAX_TRANSFER_BYTES;
-      processed = 1;
-      echo_all(&processed, 1);
+      echo_all(buf_out, total_processed);
+      //echo_all(&availables, 1);
     }
+    else
+      set_data_in(buf_in, count);
   }
-  if(!processed) {
-    // pprintf("Sending: %02x", buf[0]);
-    uint8_t total_processed = 0;
-    uint8_t buf_out[MAX_TRANSFER_BYTES*2];
-    while(total_processed < count) {
-      uint8_t transferable = num_bytes_per_transfer;
-      //if(count-total_processed < transferable)
-        //transferable = count-total_processed;
-      pio_spi_write8_read8_blocking(&spi, buf_in + total_processed, buf_out + total_processed, transferable);
-      total_transferred += transferable;
-      total_processed += transferable;
-      busy_wait_us(us_between_transfer);
-    }
-    echo_all(buf_out, total_processed);
-    //echo_all(&availables, 1);
+}
+
+void handle_output_data() {
+  if(is_mode_active)
+    return;
+
+  // Periodically check for issues
+  linkcable_passive_check_for_transmission_error();
+
+  size_t possible = available_data_out();
+  if(possible == 0)
+    return;
+  // Handle section transfers in a special way
+  if(is_preamble_mode_requested)
+    return;
+  if(possible > MAX_TRANSFER_BYTES)
+    possible = MAX_TRANSFER_BYTES;
+
+  uint8_t total_processed = 0;
+  uint8_t buf_out[MAX_TRANSFER_BYTES*2];
+  bool success = false;
+
+  for(size_t i = 0; i < possible; i++) {
+    uint8_t data = get_data_out(&success);
+    if(success)
+      buf_out[total_processed++] = data;
   }
+
+  echo_all(buf_out, total_processed);
 }
 
 void webserial_task(void)
 {
-  if ( web_serial_connected )
+  if ( web_serial_connected ) {
     if ( tud_vendor_available() ) {
       uint8_t buf_in[MAX_TRANSFER_BYTES*2];
       uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
       handle_input_data(buf_in, count);
     }
+  }
 }
 
 
@@ -386,13 +675,14 @@ void webserial_task(void)
 //--------------------------------------------------------------------+
 void cdc_task(void)
 {
-  if ( tud_cdc_connected() )
+  if ( tud_cdc_connected() ) {
     // connected and there are data available
     if ( tud_cdc_available() ) {
       uint8_t buf_in[MAX_TRANSFER_BYTES*2];
       uint32_t count = tud_cdc_read((uint8_t*)buf_in, sizeof(buf_in));
       handle_input_data(buf_in, count);
     }
+  }
 }
 
 // Invoked when cdc when line state changed e.g connected/disconnected

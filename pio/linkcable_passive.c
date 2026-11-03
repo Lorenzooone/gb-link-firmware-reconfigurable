@@ -14,6 +14,11 @@
 
 // Regular defines
 #define LINKCABLE_CAN_DISABLE_TIMEOUT SEC(1)
+// Technically an active device could take however much time it wants to send
+// the bits, however in reality game boys take way less time, so just detect
+// an error after 1 second. This can be a problem if your device has a
+// transmission rate <= 8 Hz, but realistically that is not a Game Boy.
+#define LINKCABLE_RESET_BAD_TRANSMISSION_TIMEOUT SEC(1)
 
 #define LOG_BUFFER_SIZE 0x2000
 #define TIMEFRAMES_BUFFER_SIZE 0x1000
@@ -36,8 +41,9 @@ uint8_t saved_bits = DEFAULT_SAVED_BITS;
 static user_time_t saved_time = 0;
 bool is_enabled = false;
 bool is_linkcable_ready = false;
-user_time_t last_transfer_time = 0;
-user_time_t shared_last_transfer_time = 0;
+volatile user_time_t last_transfer_time = 0;
+volatile user_time_t start_transfer_time = 0;
+volatile user_time_t shared_last_transfer_time = 0;
 sync_t ack_time_request;
 
 static uint16_t patched_instructions_sck[64];
@@ -65,6 +71,12 @@ static void TIME_SENSITIVE(linkcable_isr)(void) {
     last_transfer_time = curr_time;
     if (linkcable_irq_handler) linkcable_irq_handler();
     if (pio_interrupt_get(curr_pio, 0)) pio_interrupt_clear(curr_pio, 0);
+}
+
+static void TIME_SENSITIVE(linkcable_isr_time_start_transmission)(void) {
+    user_time_t curr_time = TIME_FUNCTION;
+    start_transfer_time = curr_time;
+    if (pio_interrupt_get(curr_pio, 1)) pio_interrupt_clear(curr_pio, 1);
 }
 
 bool linkcable_passive_is_enabled(void) {
@@ -100,6 +112,11 @@ void TIME_SENSITIVE(linkcable_passive_flush)(void) {
 
 void linkcable_passive_enable(void) {
     while(!is_linkcable_ready);
+    #ifdef linkcable_sm_passive_CHECK_TRANSMISSION_ERROR
+    user_time_t curr_time = TIME_FUNCTION;
+    start_transfer_time = curr_time;
+    last_transfer_time = curr_time;
+    #endif
     is_enabled = true;
     linkcable_sm_passive_activate(curr_pio, curr_sm, linkcable_pio_initial_pc, saved_bits, curr_pin_sck, curr_pin_sin, curr_pin_sout);
 }
@@ -127,12 +144,29 @@ void linkcable_passive_set_is_32(bool is_32) {
     linkcable_sm_passive_select_mode(curr_pio, curr_sm, saved_bits);
 }
 
+void linkcable_passive_check_for_transmission_error() {
+    if(!linkcable_passive_is_enabled())
+        return;
+
+    #ifdef linkcable_sm_passive_CHECK_TRANSMISSION_ERROR
+    user_time_comparison_t last_saved_transfer_time = (user_time_comparison_t)last_transfer_time;
+    user_time_comparison_t last_saved_start_time = (user_time_comparison_t)start_transfer_time;
+    user_time_comparison_t curr_time = (user_time_comparison_t)TIME_FUNCTION;
+    if((last_saved_start_time - last_saved_transfer_time) <= ((user_time_comparison_t)0))
+        return;
+    if((curr_time - last_saved_transfer_time) > ((user_time_comparison_t)LINKCABLE_RESET_BAD_TRANSMISSION_TIMEOUT))
+        linkcable_passive_reset(true);
+    #endif
+}
+
 void linkcable_passive_init(irq_handler_t onDataReceive, uint wanted_pio, uint sm, uint num_bits, uint pin_sck, uint pin_sin, uint pin_sout) {
     curr_pio = pio0;
     int irq_pio = PIO0_IRQ_0;
+    int irq1_pio = PIO0_IRQ_1;
     if(wanted_pio == 1) {
         curr_pio = pio1;
         irq_pio = PIO1_IRQ_0;
+        irq1_pio = PIO1_IRQ_1;
     }
     curr_sm = sm;
     curr_pin_sck = pin_sck;
@@ -148,5 +182,10 @@ void linkcable_passive_init(irq_handler_t onDataReceive, uint wanted_pio, uint s
         irq_set_exclusive_handler(irq_pio, linkcable_isr);
         irq_set_enabled(irq_pio, true);
     }
+    #ifdef linkcable_sm_passive_CHECK_TRANSMISSION_ERROR
+    pio_set_irq1_source_enabled(curr_pio, pis_interrupt1, true);
+    irq_set_exclusive_handler(irq1_pio, linkcable_isr_time_start_transmission);
+    irq_set_enabled(irq1_pio, true);
+    #endif
     is_linkcable_ready = true;
 }

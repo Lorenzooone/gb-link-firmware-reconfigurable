@@ -30,5 +30,7 @@ void linkcable_passive_init(linkcable_handler_t onReceive, uint wanted_pio, uint
 bool can_disable_linkcable_passive_handler(void);
 // Debug function
 void print_last_linkcable_passive(void);
+// Check for transmission errors and fix them
+void linkcable_passive_check_for_transmission_error(void);
 
 #endif

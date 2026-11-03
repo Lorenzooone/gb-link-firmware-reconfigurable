@@ -15,6 +15,8 @@ target_include_directories(gbusb PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
 target_sources(gbusb PRIVATE
         main.c
+        io_buffer.c
+        utils.c
 
         usb_descriptors.c
 

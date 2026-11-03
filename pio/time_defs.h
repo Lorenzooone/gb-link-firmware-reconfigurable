@@ -29,6 +29,8 @@ enum time_resolution {
 
 typedef uint64_t user_time_t;
 
+typedef int64_t user_time_comparison_t;
+
 #define CURR_BOARD_TIME_RESOLUTION RESOLUTION_MICRO_SECONDS
 
 #endif /* _TIME_DEFS_H_ */
