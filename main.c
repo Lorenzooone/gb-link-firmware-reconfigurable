@@ -37,6 +37,7 @@
 #include "pico/time.h"
 #include "pio/linkcable_passive.h"
 #include "pio/useful_qualifiers.h"
+#include "pio/time_defs.h"
 #include "utils.h"
 
 #define NUM_CMP_BYTES 0x20
@@ -104,6 +105,7 @@ static uint8_t buf_count;
 static uint8_t num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
 static uint32_t us_between_transfer = US_DEFAULT_PER_TRANSFER;
 static uint32_t total_transferred = 0;
+static user_time_t last_active_transfer_time = 0;
 
 // Determine which of the two modes to use...
 static bool is_mode_active = true;
@@ -149,11 +151,12 @@ void TIME_SENSITIVE(link_cable_passive_handler)(void);
   };
 
 void pio_spi_active_enable() {
-	pio_spi_active_activate(spi.pio, spi.sm, spi.program_offset, spi.cpol, PIN_SCK, PIN_SIN, PIN_SOUT);
+    last_active_transfer_time = TIME_FUNCTION;
+    pio_spi_active_activate(spi.pio, spi.sm, spi.program_offset, spi.cpol, PIN_SCK, PIN_SIN, PIN_SOUT);
 }
 
 void pio_spi_active_disable() {
-	pio_sm_set_enabled(spi.pio, spi.sm, false);
+    pio_sm_set_enabled(spi.pio, spi.sm, false);
     pio_sm_clear_fifos(spi.pio, spi.sm);
     pio_sm_restart(spi.pio, spi.sm);
     pio_sm_clkdiv_restart(spi.pio, spi.sm);
@@ -616,10 +619,14 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
         uint8_t transferable = num_bytes_per_transfer;
         //if(count-total_processed < transferable)
           //transferable = count-total_processed;
+        user_time_t curr_time = TIME_FUNCTION;
+        user_time_comparison_t remaining_time = (((user_time_comparison_t)last_active_transfer_time) + MUSEC(us_between_transfer)) - ((user_time_comparison_t)curr_time);
+        if(remaining_time > 0)
+          busy_wait_us(remaining_time);
         pio_spi_write8_read8_blocking(&spi, buf_in + total_processed, buf_out + total_processed, transferable);
         total_transferred += transferable;
         total_processed += transferable;
-        busy_wait_us(us_between_transfer);
+        last_active_transfer_time = TIME_FUNCTION;
       }
       echo_all(buf_out, total_processed);
       //echo_all(&availables, 1);
